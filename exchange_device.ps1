@@ -65,10 +65,24 @@ function Test-IsDesktopClient {
     # Get-MobileDevice also returns Mac Mail.app and Windows Mail app partnerships,
     # since both connect over ActiveSync (EAS) just like a phone. This function flags
     # those so the script never wipes/removes/blocks a desktop mail session.
+    #
+    # IMPORTANT: DeviceType "Outlook" alone is ambiguous - the modern "Outlook for iOS
+    # and Android" mobile app also reports DeviceType = "Outlook" (with DeviceModel =
+    # "Outlook for iOS and Android"). So we check DeviceModel/DeviceOS for explicit
+    # mobile-OS indicators FIRST and treat those as an override that always wins.
     param($DeviceType, $DeviceOS, $DeviceUserAgent, $DeviceModel)
 
+    $mobileIndicatorPatterns = @(
+        'iOS', 'iPhone', 'iPad', 'Android'
+    )
+    foreach ($p in $mobileIndicatorPatterns) {
+        if ($DeviceModel -and $DeviceModel -match $p)      { return $false }
+        if ($DeviceOS -and $DeviceOS -match $p)            { return $false }
+        if ($DeviceUserAgent -and $DeviceUserAgent -match $p) { return $false }
+    }
+
     $desktopTypePatterns = @(
-        '^WindowsMail$', '^MacOutlook$', '^OutlookMac$', '^Outlook$'
+        '^WindowsMail$', '^MacOutlook$', '^OutlookMac$'
     )
     $desktopOsPatterns = @(
         'Mac OS X', 'macOS', 'Windows NT', 'Windows 10\.0', 'Windows 11'
@@ -148,6 +162,7 @@ foreach ($User in $UserList) {
         # --- Guard: never process Mac/PC desktop mail clients, only real mobile devices ---
         $isDesktop = Test-IsDesktopClient -DeviceType $Device.DeviceType -DeviceOS $Device.DeviceOS `
                                            -DeviceUserAgent $Device.DeviceUserAgent -DeviceModel $Device.DeviceModel
+        Log "Classification for $id : DeviceType=$($Device.DeviceType) DeviceModel=$($Device.DeviceModel) DeviceOS=$($Device.DeviceOS) -> IsDesktop=$isDesktop"
         if ($isDesktop) {
             Log "SKIP (desktop/Mac/PC client, NOT a mobile device - will not wipe/remove/block): $id Type=$($Device.DeviceType) OS=$($Device.DeviceOS)"
             $r = New-Result -User $User -DeviceId $id -DeviceType $Device.DeviceType -DeviceModel $Device.DeviceModel -LastSync 'N/A'
