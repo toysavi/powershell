@@ -4,54 +4,84 @@ param(
 )
 
 $log = "C:\Logs\awx-clean-mobiledevices.log"
-
-function Log($msg){
-    Add-Content $log "$(Get-Date) | $msg"
+function Log($msg) {
+    Add-Content $log "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') | $msg"
 }
 
-$UserList = $Users -split "`n"
-$InputDevices = $DeviceIds -split "`n"
+# --- Load Exchange snap-in in THIS session (this was missing) ---
+if (-not (Get-PSSnapin -Name Microsoft.Exchange.Management.PowerShell.SnapIn -ErrorAction SilentlyContinue)) {
+    try {
+        Add-PSSnapin Microsoft.Exchange.Management.PowerShell.SnapIn -ErrorAction Stop
+        Log "Snap-in loaded successfully."
+    } catch {
+        Log "FATAL: Could not load Exchange snap-in: $($_.Exception.Message)"
+        exit 1
+    }
+}
+
+if (-not (Get-Command Get-MobileDevice -ErrorAction SilentlyContinue)) {
+    Log "FATAL: Get-MobileDevice not available after snap-in load."
+    exit 1
+}
+
+# --- Clean split, trim, drop blanks ---
+$UserList     = $Users     -split '\r?\n' | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne '' }
+$InputDevices = $DeviceIds -split '\r?\n' | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne '' }
 
 Log "START PROCESS"
+Log "Users to process: $($UserList -join ', ')"
+Log "Device filter: $(if ($InputDevices.Count -gt 0) { $InputDevices -join ', ' } else { 'NONE (all devices)' })"
 
 foreach ($User in $UserList) {
-
-    if ([string]::IsNullOrWhiteSpace($User)) { continue }
-
     Log "USER: $User"
 
-    # Get all devices for user
-    $Devices = Get-MobileDevice -Mailbox $User
+    try {
+        $Devices = Get-MobileDevice -Mailbox $User -ErrorAction Stop
+    } catch {
+        Log "ERROR: Get-MobileDevice failed for $User -> $($_.Exception.Message)"
+        continue
+    }
+
+    if (-not $Devices -or $Devices.Count -eq 0) {
+        Log "No mobile devices found for $User"
+        continue
+    }
 
     foreach ($Device in $Devices) {
-
         $id = $Device.DeviceId
 
-        # If device filter provided → restrict
-        if ($InputDevices.Count -gt 0 -and $InputDevices[0] -ne "") {
-            if ($InputDevices -notcontains $id) {
+        if ($InputDevices.Count -gt 0) {
+            # Normalize both sides (strip dashes, uppercase) before comparing
+            $normId     = ($id -replace '-', '').ToUpper()
+            $normFilter = $InputDevices | ForEach-Object { ($_ -replace '-', '').ToUpper() }
+
+            if ($normFilter -notcontains $normId) {
+                Log "SKIP (not in filter): $id"
                 continue
             }
         }
 
-        # =========================
-        # ALWAYS EXECUTE (NO MODE)
-        # =========================
+        try {
+            Clear-MobileDevice -Identity $id -AccountOnly -ErrorAction Stop
+            Log "WIPED: $id"
+        } catch {
+            Log "ERROR wiping $id -> $($_.Exception.Message)"
+            continue
+        }
 
-        # 1. Account-only wipe
-        Clear-MobileDevice -Identity $id -AccountOnly
-        Log "WIPED: $id"
+        try {
+            Remove-MobileDevice -Identity $id -Confirm:$false -ErrorAction Stop
+            Log "REMOVED: $id"
+        } catch {
+            Log "ERROR removing $id -> $($_.Exception.Message)"
+        }
 
-        # 2. Remove device
-        Remove-MobileDevice -Identity $id -Confirm:$false
-        Log "REMOVED: $id"
-
-        # 3. Block device
-        Set-CASMailbox -Identity $User `
-            -ActiveSyncBlockedDeviceIDs @{add=$id}
-
-        Log "BLOCKED: $id"
+        try {
+            Set-CASMailbox -Identity $User -ActiveSyncBlockedDeviceIDs @{add=$id} -ErrorAction Stop
+            Log "BLOCKED: $id"
+        } catch {
+            Log "ERROR blocking $id on $User -> $($_.Exception.Message)"
+        }
     }
 }
-
 Log "END PROCESS"
