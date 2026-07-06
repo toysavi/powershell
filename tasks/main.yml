@@ -1,5 +1,132 @@
+---
+- name: TEST - WinRM connection check
+  ansible.windows.win_ping:
+
+- name: TEST - Check PowerShell execution
+  ansible.windows.win_shell: |
+    Get-Host | Select-Object Version
+  register: ps_test
+  changed_when: false
+
+- name: DEBUG PowerShell version
+  ansible.builtin.debug:
+    var: ps_test.stdout
+
+- name: TEST - Exchange On-Prem Cmdlet Access
+  ansible.windows.win_shell: |
+    $ErrorActionPreference = 'Stop'
+    try {
+        Add-PSSnapin Microsoft.Exchange.Management.PowerShell.SnapIn -ErrorAction Stop
+    } catch {
+        if ($_.Exception.Message -notmatch 'already added') {
+            Write-Output "SNAPIN_LOAD_FAILED: $($_.Exception.Message)"
+            exit 1
+        }
+    }
+    if (Get-Command Get-MobileDevice -ErrorAction SilentlyContinue) {
+        Write-Output "EXCHANGE_ONPREM_OK"
+    } else {
+        Write-Output "EXCHANGE_NOT_READY"
+        exit 1
+    }
+  register: exch_test
+  changed_when: false
+  failed_when: exch_test.rc != 0
+
+- name: DEBUG Exchange snap-in test result
+  ansible.builtin.debug:
+    var: exch_test.stdout_lines
+
+- name: Ensure staging directory exists on target
+  ansible.windows.win_file:
+    path: "C:\\ProgramData\\ansible_scripts\\exchange_device"
+    state: directory
+
+- name: Stage Exchange Device Automation Script on target
+  ansible.windows.win_copy:
+    src: "{{ role_path }}/files/exchange_device.ps1"
+    dest: "C:\\ProgramData\\ansible_scripts\\exchange_device\\exchange_device.ps1"
+  register: copy_result
+
+- name: Verify PS1 exists on target
+  ansible.windows.win_stat:
+    path: "C:\\ProgramData\\ansible_scripts\\exchange_device\\exchange_device.ps1"
+  register: ps_check
+
+- name: Fail early if script staging did not work
+  ansible.builtin.fail:
+    msg: "exchange_device.ps1 was not found on the target after win_copy."
+  when: not ps_check.stat.exists
+
+- name: DIAGNOSTIC - confirm deployed script matches the latest version
+  ansible.windows.win_shell: |
+    Select-String -Path "C:\ProgramData\ansible_scripts\exchange_device\exchange_device.ps1" -Pattern "SCRIPT VERSION"
+  register: script_version_check
+  changed_when: false
+
+- name: DEBUG deployed script version marker
+  ansible.builtin.debug:
+    var: script_version_check.stdout
+
+- name: DIAGNOSTIC - confirm target mailbox identity resolves before running cleanup
+  ansible.windows.win_shell: |
+    $ErrorActionPreference = 'Stop'
+    Add-PSSnapin Microsoft.Exchange.Management.PowerShell.SnapIn -ErrorAction SilentlyContinue
+    try {
+        Get-Mailbox -Identity "{{ users }}" | Select-Object DisplayName, PrimarySmtpAddress
+    } catch {
+        Write-Output "MAILBOX_LOOKUP_FAILED: $($_.Exception.Message)"
+    }
+  register: mailbox_check
+  changed_when: false
+
+- name: DEBUG mailbox identity check
+  ansible.builtin.debug:
+    var: mailbox_check.stdout
+
 - name: Execute Exchange Device Automation Script
-  win_shell: |
-    powershell.exe -ExecutionPolicy Bypass -File "{{ role_path }}/scripts/exchange_device.ps1" `
-    -Users "{{ users }}" `
-    -DeviceIds "{{ device_ids }}"
+  ansible.windows.win_shell: |
+    powershell.exe -NoProfile -ExecutionPolicy Bypass `
+      -File "C:\ProgramData\ansible_scripts\exchange_device\exchange_device.ps1" `
+      -Users "{{ users }}" `
+      -DeviceIds "{{ device_ids }}"
+  register: exch_result
+  failed_when: false   # success/failure is evaluated from the parsed JSON below
+
+- name: DEBUG raw script output (full, for troubleshooting)
+  ansible.builtin.debug:
+    var: exch_result.stdout_lines
+
+- name: Extract structured JSON result block from script stdout
+  ansible.builtin.set_fact:
+    exch_json_raw: "{{ exch_result.stdout | regex_search('(?s)===RESULT_JSON_START===\\r?\\n(.*?)\\r?\\n===RESULT_JSON_END===', '\\1') }}"
+
+- name: Fail clearly if no JSON block was found (script likely errored before reporting)
+  ansible.builtin.fail:
+    msg: >-
+      No structured result JSON found in script output.
+      This usually means the script hit a fatal error before it could run any device actions.
+      Check the raw output above and C:\Logs\awx-clean-mobiledevices.log on the target.
+  when: exch_json_raw | length == 0
+
+- name: Parse device results
+  ansible.builtin.set_fact:
+    device_results: "{{ exch_json_raw[0] | from_json }}"
+
+- name: Show per-device outcome
+  ansible.builtin.debug:
+    msg: >-
+      User={{ item.User }}
+      Device={{ item.DeviceId }}
+      Wipe={{ item.WipeStatus }}
+      Remove={{ item.RemoveStatus }}
+      Block={{ item.BlockStatus }}
+      Result={{ item.OverallResult }}
+  loop: "{{ device_results }}"
+  loop_control:
+    label: "{{ item.User }} / {{ item.DeviceId }}"
+
+- name: Fail the play if any device failed
+  ansible.builtin.fail:
+    msg: "One or more devices failed to process. See per-device output above and the CSV report on the target under C:\\Logs\\."
+  when: device_results | selectattr('OverallResult', 'match', '^FAILED') | list | length > 0
