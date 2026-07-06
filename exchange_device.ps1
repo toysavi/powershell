@@ -123,9 +123,21 @@ foreach ($User in $UserList) {
             }
         }
 
+        # IMPORTANT: DeviceId (bare string) is NOT accepted by Clear-MobileDevice /
+        # Remove-MobileDevice -Identity on most on-prem Exchange builds. Those cmdlets
+        # need the full device Identity path (Device.Identity), not Device.DeviceId.
+        # DeviceId is still used above for filtering since that's the human-friendly
+        # value operators supply, but the action cmdlets must use $Device.Identity.
+        $identity = $Device.Identity
+        if ([string]::IsNullOrWhiteSpace($identity)) {
+            Log "WARN: Device.Identity was empty for $id, falling back to DeviceId (may fail)"
+            $identity = $id
+        }
+        Log "Resolved Identity for action cmdlets: $identity"
+
         $stats = $null
         try {
-            $stats = Get-MobileDeviceStatistics -Identity $id -ErrorAction Stop
+            $stats = Get-MobileDeviceStatistics -Identity $identity -ErrorAction Stop
         } catch {
             Log "WARN: could not read stats for $id -> $($_.Exception.Message)"
         }
@@ -137,7 +149,7 @@ foreach ($User in $UserList) {
 
         # 1. Account-only wipe
         try {
-            Clear-MobileDevice -Identity $id -AccountOnly -ErrorAction Stop
+            Clear-MobileDevice -Identity $identity -AccountOnly -ErrorAction Stop
             $r.WipeStatus = 'Success'
             $r.WipeDetail = 'Account-only wipe queued'
             Log "WIPED: $id"
@@ -149,7 +161,7 @@ foreach ($User in $UserList) {
 
         # 2. Remove partnership -> kills the active EAS session
         try {
-            Remove-MobileDevice -Identity $id -Confirm:$false -ErrorAction Stop
+            Remove-MobileDevice -Identity $identity -Confirm:$false -ErrorAction Stop
             $r.RemoveStatus = 'Success'
             $r.RemoveDetail = 'Partnership removed, session terminated'
             Log "REMOVED: $id"
