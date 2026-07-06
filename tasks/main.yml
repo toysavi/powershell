@@ -1,0 +1,5 @@
+- name: Execute Exchange Device Automation Script
+  win_shell: |
+    powershell.exe -ExecutionPolicy Bypass -File "{{ role_path }}/scripts/exchange_device.ps1" `
+    -Users "{{ users }}" `
+    -DeviceIds "{{ device_ids }}"

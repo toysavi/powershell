@@ -1,0 +1,6 @@
+- name: Exchange Device Automation (Role-based)
+  hosts: "{{ target_host }}"
+  gather_facts: no
+
+  roles:
+    - exchange_device
