@@ -1,7 +1,6 @@
 param(
     [string]$Users,
-    [string]$DeviceIds,
-    [switch]$PermanentlyBlock = $false   # default OFF -> relies on org Quarantine default for re-approval
+    [string]$DeviceIds
 )
 
 $logDir    = "C:\Logs"
@@ -48,7 +47,7 @@ $InputDevices = $DeviceIds -split '\r?\n' | ForEach-Object { $_.Trim() } | Where
 Log "START PROCESS"
 Log "Users to process (count=$($UserList.Count)): $($UserList -join ', ')"
 Log "Device filter (count=$($InputDevices.Count)): $(if ($InputDevices.Count -gt 0) { $InputDevices -join ', ' } else { 'NONE (all devices)' })"
-Log "PermanentlyBlock switch: $PermanentlyBlock"
+Log "Block policy: always block DeviceId + clear any pre-existing allow entry (no reliance on org Quarantine default alone)"
 
 if ($UserList.Count -eq 0) {
     Log "FATAL: No users parsed from -Users input. Check the value being passed from Ansible."
@@ -147,17 +146,15 @@ foreach ($User in $UserList) {
              -DeviceModel $(if ($stats) { $stats.DeviceModel } else { $Device.DeviceModel }) `
              -LastSync    $(if ($stats) { $stats.LastSuccessSync } else { 'Unknown' })
 
-        # 1. Account-only wipe
-        try {
-            Clear-MobileDevice -Identity $identity -AccountOnly -ErrorAction Stop
-            $r.WipeStatus = 'Success'
-            $r.WipeDetail = 'Account-only wipe queued'
-            Log "WIPED: $id"
-        } catch {
-            $r.WipeStatus = 'Failed'
-            $r.WipeDetail = $_.Exception.Message
-            Log "ERROR wiping $id -> $($_.Exception.Message)"
-        }
+        # 1. Account-only wipe is NOT supported by on-prem Exchange's Clear-MobileDevice
+        #    (-AccountOnly is an Exchange Online-only parameter). On-prem only offers a
+        #    FULL device wipe via Clear-MobileDevice, which was declined as too destructive
+        #    relative to the goal (remove only the account). Wipe step is intentionally
+        #    skipped; Remove-MobileDevice + explicit block below is what actually protects
+        #    the mailbox going forward.
+        $r.WipeStatus = 'Skipped'
+        $r.WipeDetail = 'On-prem Exchange does not support account-only wipe (Online-only parameter); full wipe declined as too destructive'
+        Log "WIPE SKIPPED for $id (on-prem limitation, full-wipe not authorized)"
 
         # 2. Remove partnership -> kills the active EAS session
         try {
@@ -171,26 +168,37 @@ foreach ($User in $UserList) {
             Log "ERROR removing $id -> $($_.Exception.Message)"
         }
 
-        # 3. Optional permanent block
-        if ($PermanentlyBlock) {
-            try {
-                Set-CASMailbox -Identity $User -ActiveSyncBlockedDeviceIDs @{add=$id} -ErrorAction Stop
-                $r.BlockStatus = 'Success'
-                $r.BlockDetail = 'DeviceID permanently blocked'
-                Log "BLOCKED: $id"
-            } catch {
-                $r.BlockStatus = 'Failed'
-                $r.BlockDetail = $_.Exception.Message
-                Log "ERROR blocking $id on $User -> $($_.Exception.Message)"
+        # 3. Force explicit block for this DeviceId. We no longer rely solely on the
+        #    org-wide Quarantine default: a per-mailbox ActiveSyncAllowedDeviceIDs entry,
+        #    or an org-wide Device Access Rule allowing this DeviceType (e.g. "Outlook
+        #    for iOS and Android" is commonly pre-allowed), can silently bypass Quarantine
+        #    and let the same DeviceId reconnect with zero approval. So: always clear any
+        #    existing allow-entry, then always block, regardless of $PermanentlyBlock.
+        try {
+            $cas = Get-CASMailbox -Identity $User -ErrorAction Stop
+            if ($cas.ActiveSyncAllowedDeviceIDs -contains $id) {
+                Set-CASMailbox -Identity $User -ActiveSyncAllowedDeviceIDs @{remove=$id} -ErrorAction Stop
+                Log "Removed pre-existing ALLOW entry for $id on $User (was bypassing Quarantine)"
             }
-        } else {
-            $r.BlockStatus = 'Skipped (relying on org Quarantine default for re-approval)'
+        } catch {
+            Log "WARN: could not check/clear ActiveSyncAllowedDeviceIDs for $User -> $($_.Exception.Message)"
         }
 
-        if ($r.WipeStatus -eq 'Success' -and $r.RemoveStatus -eq 'Success') {
+        try {
+            Set-CASMailbox -Identity $User -ActiveSyncBlockedDeviceIDs @{add=$id} -ErrorAction Stop
+            $r.BlockStatus = 'Success'
+            $r.BlockDetail = 'DeviceID blocked - requires manual admin re-approval to reconnect'
+            Log "BLOCKED: $id"
+        } catch {
+            $r.BlockStatus = 'Failed'
+            $r.BlockDetail = $_.Exception.Message
+            Log "ERROR blocking $id on $User -> $($_.Exception.Message)"
+        }
+
+        if ($r.RemoveStatus -eq 'Success' -and $r.BlockStatus -eq 'Success') {
             $r.OverallResult = 'SUCCESS'
         } elseif ($r.RemoveStatus -eq 'Success') {
-            $r.OverallResult = 'PARTIAL (session killed, wipe failed)'
+            $r.OverallResult = 'PARTIAL (session killed, block failed - device could reconnect unblocked)'
         } else {
             $r.OverallResult = 'FAILED'
         }
