@@ -109,9 +109,13 @@
       Check the raw output above and C:\Logs\awx-clean-mobiledevices.log on the target.
   when: exch_json_raw | length == 0
 
-- name: Parse device results
+- name: Parse device results (raw)
   ansible.builtin.set_fact:
-    device_results: "{{ exch_json_raw[0] | from_json }}"
+    device_results_raw: "{{ exch_json_raw[0] | from_json }}"
+
+- name: Normalize to a list (PowerShell collapses single-item arrays to an object)
+  ansible.builtin.set_fact:
+    device_results: "{{ [device_results_raw] if device_results_raw is mapping else device_results_raw }}"
 
 - name: Show per-device outcome
   ansible.builtin.debug:
