@@ -53,6 +53,38 @@ if ($UserList.Count -eq 0) {
     Log "FATAL: No users parsed from -Users input. Check the value being passed from Ansible."
 }
 
+if ($InputDevices.Count -eq 0) {
+    Log "FATAL: No DeviceIds provided. Refusing to run - this script only acts on DeviceIds explicitly supplied via the survey, never on 'all devices for a user'."
+    Write-Output "===RESULT_JSON_START==="
+    @([PSCustomObject]@{ User = ($UserList -join ','); DeviceId = 'N/A'; OverallResult = 'FATAL: no DeviceIds supplied - refusing to process all devices' }) | ConvertTo-Json -Depth 4
+    Write-Output "===RESULT_JSON_END==="
+    exit 1
+}
+
+function Test-IsDesktopClient {
+    # Get-MobileDevice also returns Mac Mail.app and Windows Mail app partnerships,
+    # since both connect over ActiveSync (EAS) just like a phone. This function flags
+    # those so the script never wipes/removes/blocks a desktop mail session.
+    param($DeviceType, $DeviceOS, $DeviceUserAgent, $DeviceModel)
+
+    $desktopTypePatterns = @(
+        '^WindowsMail$', '^MacOutlook$', '^OutlookMac$', '^Outlook$'
+    )
+    $desktopOsPatterns = @(
+        'Mac OS X', 'macOS', 'Windows NT', 'Windows 10\.0', 'Windows 11'
+    )
+
+    foreach ($p in $desktopTypePatterns) {
+        if ($DeviceType -and $DeviceType -match $p) { return $true }
+    }
+    foreach ($p in $desktopOsPatterns) {
+        if ($DeviceOS -and $DeviceOS -match $p)          { return $true }
+        if ($DeviceUserAgent -and $DeviceUserAgent -match $p) { return $true }
+        if ($DeviceModel -and $DeviceModel -match $p)    { return $true }
+    }
+    return $false
+}
+
 $Results = [System.Collections.Generic.List[object]]::new()
 
 function New-Result {
@@ -111,16 +143,32 @@ foreach ($User in $UserList) {
 
     foreach ($Device in $Devices) {
         $id = $Device.DeviceId
-        Log "Found device: Id=$id Type=$($Device.DeviceType) Model=$($Device.DeviceModel)"
+        Log "Found device: Id=$id Type=$($Device.DeviceType) OS=$($Device.DeviceOS) Model=$($Device.DeviceModel)"
 
-        if ($InputDevices.Count -gt 0) {
-            $normId     = ($id -replace '-', '').ToUpper()
-            $normFilter = $InputDevices | ForEach-Object { ($_ -replace '-', '').ToUpper() }
-            if ($normFilter -notcontains $normId) {
-                Log "SKIP (DeviceId not in supplied filter): $id"
-                continue
-            }
+        # --- Guard: never process Mac/PC desktop mail clients, only real mobile devices ---
+        $isDesktop = Test-IsDesktopClient -DeviceType $Device.DeviceType -DeviceOS $Device.DeviceOS `
+                                           -DeviceUserAgent $Device.DeviceUserAgent -DeviceModel $Device.DeviceModel
+        if ($isDesktop) {
+            Log "SKIP (desktop/Mac/PC client, NOT a mobile device - will not wipe/remove/block): $id Type=$($Device.DeviceType) OS=$($Device.DeviceOS)"
+            $r = New-Result -User $User -DeviceId $id -DeviceType $Device.DeviceType -DeviceModel $Device.DeviceModel -LastSync 'N/A'
+            $r.OverallResult = 'Skipped - desktop/Mac/PC client, not a mobile device'
+            $Results.Add($r)
+            continue
         }
+
+        # --- Guard: only act on DeviceIds explicitly supplied via the survey.
+        # Every other device on this mailbox is skipped, no exceptions. ---
+        $normId     = ($id -replace '-', '').ToUpper()
+        $normFilter = $InputDevices | ForEach-Object { ($_ -replace '-', '').ToUpper() }
+
+        if ($normFilter -notcontains $normId) {
+            Log "SKIP (DeviceId not in survey-supplied list): $id -- left untouched"
+            $r = New-Result -User $User -DeviceId $id -DeviceType $Device.DeviceType -DeviceModel $Device.DeviceModel -LastSync 'N/A'
+            $r.OverallResult = 'Skipped - DeviceId not requested in survey'
+            $Results.Add($r)
+            continue
+        }
+        Log "MATCH: $id is in the survey-supplied DeviceIds list, proceeding"
 
         # IMPORTANT: DeviceId (bare string) is NOT accepted by Clear-MobileDevice /
         # Remove-MobileDevice -Identity on most on-prem Exchange builds. Those cmdlets
@@ -208,6 +256,10 @@ foreach ($User in $UserList) {
 }
 
 Log "END PROCESS"
+$desktopSkipped  = ($Results | Where-Object { $_.OverallResult -match 'desktop/Mac/PC' }).Count
+$notRequested    = ($Results | Where-Object { $_.OverallResult -match 'not requested in survey' }).Count
+$actuallyProcessed = ($Results | Where-Object { $_.OverallResult -in @('SUCCESS','FAILED') -or $_.OverallResult -match 'PARTIAL' }).Count
+Log "Summary: $actuallyProcessed device(s) actually processed, $desktopSkipped desktop/Mac/PC device(s) skipped, $notRequested device(s) skipped (not requested in survey)"
 
 $Results | Export-Csv -Path $reportCsv -NoTypeInformation -Encoding UTF8
 Log "Report written: $reportCsv"
